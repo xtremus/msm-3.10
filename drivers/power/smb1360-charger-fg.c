@@ -413,6 +413,9 @@ struct smb1360_chip {
 	bool				batt_warm;
 	bool				batt_cool;
 	bool				batt_full;
+#ifdef CONFIG_MACH_T86519A1
+	bool				power_ok;
+#endif
 	bool				resume_completed;
 	bool				irq_waiting;
 	bool				irq_disabled;
@@ -509,6 +512,10 @@ static void smb1360_wakeup_src_init(struct smb1360_chip *chip)
 	spin_lock_init(&chip->smb1360_ws.ws_lock);
 	wakeup_source_init(&chip->smb1360_ws.source, "smb1360");
 }
+
+#ifdef CONFIG_MACH_T86519A1
+static int high_temp_chg = 1;
+#endif
 
 static int is_between(int value, int left, int right)
 {
@@ -1151,7 +1158,11 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 	if (is_device_suspended(chip))
 		return POWER_SUPPLY_STATUS_UNKNOWN;
 
-	if (chip->batt_full)
+	if (chip->batt_full
+#ifdef CONFIG_MACH_T86519A1
+			&& chip->usb_present
+#endif
+	)
 		return POWER_SUPPLY_STATUS_FULL;
 
 	rc = smb1360_read(chip, STATUS_3_REG, &reg);
@@ -1161,6 +1172,11 @@ static int smb1360_get_prop_batt_status(struct smb1360_chip *chip)
 	}
 
 	pr_debug("STATUS_3_REG = %x\n", reg);
+
+#ifdef CONFIG_MACH_T86519A1
+	if (!chip->power_ok)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+#endif
 
 	if (reg & CHG_HOLD_OFF_BIT)
 		return POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -1248,6 +1264,13 @@ static int smb1360_get_prop_batt_capacity(struct smb1360_chip *chip)
 
 	pr_debug("msys_soc_reg=0x%02x, fg_soc=%d batt_full = %d\n", reg,
 						soc, chip->batt_full);
+
+#ifdef CONFIG_MACH_T86519A1
+	if (soc == 100 && chip->batt_full == 0)
+		chip->batt_full = 1;
+	else if (soc < 100 && chip->batt_full == 1)
+		chip->batt_full = 0;
+#endif
 
 	chip->soc_now = (chip->batt_full ? 100 : bound(soc, 0, 100));
 
@@ -2120,13 +2143,25 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 {
 	int temp;
 	int rc = 0;
+	bool enable_charge = false;
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct smb1360_chip *chip = container_of(dwork, struct smb1360_chip,
 							jeita_work);
 	temp = smb1360_get_prop_batt_temp(chip);
 
+#ifdef CONFIG_MACH_T86519A1
+	if(!high_temp_chg && temp < chip->warm_bat_decidegc) {
+		pr_info("low temp threshold, enable charging\n");
+		smb1360_charging_disable(chip, USER, 0);
+		power_supply_changed(&chip->batt_psy);
+		power_supply_changed(chip->usb_psy);
+		high_temp_chg = 1;
+	}
+#endif
+
 	if (temp > chip->hot_bat_decidegc) {
-		/* battery status is hot, only config thresholds */
+		/* battery status is hot, disable charge and config thresholds */
+		enable_charge = false;
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->warm_bat_decidegc, chip->hot_bat_decidegc);
 		if (rc) {
@@ -2138,6 +2173,21 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 		/* battery status is warm, do compensation manually */
 		chip->batt_warm = true;
 		chip->batt_cool = false;
+		/* Enable/disable charging based on requested current */
+		enable_charge = (chip->warm_bat_ma > 0) ? true : false;
+		if (!enable_charge) {
+			/* Skip setting voltage/current if charging disabled */
+			goto toggle_charging;
+		}
+#ifdef CONFIG_MACH_T86519A1
+		if(high_temp_chg && temp >= chip->hot_bat_decidegc) {
+			high_temp_chg = 0;
+			pr_info("high temp threshold, disable charging\n");
+			smb1360_charging_disable(chip, USER, 1);
+			power_supply_changed(&chip->batt_psy);
+			power_supply_changed(chip->usb_psy);
+		}
+#endif
 		rc = smb1360_float_voltage_set(chip, chip->warm_bat_mv);
 		if (rc) {
 			dev_err(chip->dev, "Couldn't set float voltage\n");
@@ -2157,6 +2207,8 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 		/* battery status is good, do the normal charging */
 		chip->batt_warm = false;
 		chip->batt_cool = false;
+		/* Always enable charging for the normal case */
+		enable_charge = true;
 		rc = smb1360_float_voltage_set(chip, chip->vfloat_mv);
 		if (rc) {
 			dev_err(chip->dev, "Couldn't set float voltage\n");
@@ -2175,11 +2227,20 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 		/* battery status is cool, do compensation manually */
 		chip->batt_cool = true;
 		chip->batt_warm = false;
+		/* Enable/disable charging based on requested current */
+		enable_charge = (chip->cool_bat_ma > 0) ? true : false;
+		if (!enable_charge) {
+			/* Skip setting voltage/current if charging disabled */
+			goto toggle_charging;
+		}
 		rc = smb1360_float_voltage_set(chip, chip->cool_bat_mv);
 		if (rc) {
 			dev_err(chip->dev, "Couldn't set float voltage\n");
 			goto end;
 		}
+		rc = smb1360_set_appropriate_usb_current(chip);
+		if (rc)
+			pr_err("Couldn't set USB current\n");
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->cold_bat_decidegc, chip->cool_bat_decidegc);
 		if (rc) {
@@ -2187,7 +2248,8 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 			goto end;
 		}
 	} else {
-		/* battery status is cold, only config thresholds */
+		/* battery status is cold, disable charge and config thresholds */
+		enable_charge = false;
 		rc = smb1360_set_soft_jeita_threshold(chip,
 			chip->cold_bat_decidegc, chip->cool_bat_decidegc);
 		if (rc) {
@@ -2195,6 +2257,16 @@ static void smb1360_jeita_work_fn(struct work_struct *work)
 			goto end;
 		}
 	}
+
+toggle_charging:
+	rc = smb1360_charging_disable(chip, JEITA_SOFT, !enable_charge);
+	if (rc) {
+		dev_err(chip->dev, "Couldn't %s charging, rc = %d\n",
+				enable_charge ? "enable" : "disable", rc);
+		goto end;
+	}
+	power_supply_changed(&chip->batt_psy);
+	power_supply_changed(chip->usb_psy);
 
 	pr_debug("warm %d, cool %d, soft_cold_rt_sts %d, soft_hot_rt_sts %d, jeita supported %d, threshold_now %d %d\n",
 		chip->batt_warm, chip->batt_cool, !!chip->soft_cold_rt_stat,
@@ -2577,6 +2649,15 @@ static int otg_oc_handler(struct smb1360_chip *chip, u8 rt_stat)
 	return 0;
 }
 
+#ifdef CONFIG_MACH_T86519A1
+static int power_ok_handler(struct smb1360_chip *chip, u8 rt_stat)
+{
+	pr_debug("xxx::usb in::rt_stat = 0x%02x\n", rt_stat);
+	chip->power_ok = rt_stat;
+	return 0;
+}
+#endif
+
 struct smb_irq_info {
 	const char		*name;
 	int			(*smb_irq)(struct smb1360_chip *chip,
@@ -2690,6 +2771,9 @@ static struct irq_handler_info handlers[] = {
 		{
 			{
 				.name		= "power_ok",
+#ifdef CONFIG_MACH_T86519A1
+				.smb_irq	= power_ok_handler,
+#endif
 			},
 			{
 				.name		= "unused",
