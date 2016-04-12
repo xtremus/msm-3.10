@@ -261,6 +261,7 @@ enum {
 
 enum {
 	USER	= BIT(0),
+	JEITA_SOFT	= BIT(1),
 };
 
 enum {
